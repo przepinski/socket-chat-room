@@ -16,6 +16,7 @@
 
 #define PORT "2000"
 #define MAX_BUF 200
+#define STDIN 0
 
 #define ERR(source) ( fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), \
                         perror(source), exit(EXIT_FAILURE) )
@@ -27,9 +28,9 @@
 #define MSG_PONG "#pong"
 #define MSG_CLOSED "#closed"
 
-void usage(char *fileName)
+void usage(char *fidataLengthame)
 {
-    fprintf(stderr, "Usage: %s\n", fileName);
+    fprintf(stderr, "Usage: %s\n", fidataLengthame);
     exit(EXIT_FAILURE);
 }
 
@@ -78,6 +79,32 @@ int makeSocket(int domain, int type)
     return socketFd;
 }
 
+void sendMessage(int clientFd, struct sockaddr_in serverAddress, char* message)
+{
+    int bytesSent;
+    printf("[SENT] \"%s\" to server\n", message);
+    if ((bytesSent=sendto(clientFd, message, strlen(message), 0,
+         (struct sockaddr *)&serverAddress, sizeof(struct sockaddr))) < 0) 
+    {
+			ERR("sendto");
+    }
+}
+
+void receiveMessage(int clientFd, char* message)
+{
+    uint bytesReceived;
+
+    if ((bytesReceived = recvfrom(clientFd, message, MAX_BUF-1, 0, NULL, NULL)) == -1) 
+    {
+        if (errno != EINTR && errno != EAGAIN) // signal or timeout
+        {
+            ERR("recvfrom");
+        }
+    }
+    message[bytesReceived] = '\0';
+    printf("[GOT] \"%s\" from server \n", message);
+}
+
 void doClient(int clientFd)
 {
     char serverName[1024];
@@ -86,46 +113,62 @@ void doClient(int clientFd)
     struct sockaddr_in serverAddress = makeAddress(serverName, PORT);
 
     printf("Ready to communicate with %s\n", serverName);
-    int bytesSent;
-    if ((bytesSent=sendto(clientFd, MSG_LOGIN, strlen(MSG_LOGIN), 0,
-         (struct sockaddr *)&serverAddress, sizeof(struct sockaddr))) < 0) 
-    {
-        ERR("sendto");
-    }
-    uint structSize = sizeof(struct sockaddr), bytesReceived;
     char message[MAX_BUF];
 
-    if ((bytesReceived = recvfrom(clientFd, message, MAX_BUF-1, 0,
-            (struct sockaddr *)&serverAddress, &structSize)) == -1) 
+    sendMessage(clientFd, serverAddress, MSG_LOGIN);
+    receiveMessage(clientFd, message);
+
+    fd_set masterFdsSet, readFdsSet;
+    int dataLength;
+    char stdinData[MAX_BUF] = {0};
+
+    FD_ZERO(&masterFdsSet);
+    FD_SET(STDIN, &masterFdsSet);
+    FD_SET(clientFd, &masterFdsSet);
+
+    sigset_t mask, oldmask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    while(!shouldQuit)
     {
-        ERR("recvfrom");
+        readFdsSet = masterFdsSet;
+        if (pselect(clientFd+1, &readFdsSet, NULL, NULL, NULL, &oldmask) == -1)
+        {
+            if (errno == EINTR) 
+                continue;
+
+            ERR("pselect");
+        }
+
+        if (FD_ISSET(STDIN, &readFdsSet))
+        {
+            fgets(stdinData, sizeof(stdinData), stdin);
+
+            dataLength = strlen(stdinData) - 1;
+            if (stdinData[dataLength] == '\n')
+                stdinData[dataLength] = '\0';
+
+            sendMessage(clientFd, serverAddress, stdinData);
+        }
+        if (FD_ISSET(clientFd, &readFdsSet))
+        {
+            receiveMessage(clientFd, message);
+            if(strcmp(message, MSG_LOGOUT) == 0 || strcmp(message, MSG_CLOSED) == 0)
+            {
+                shouldQuit = 1;
+            }
+            else 
+            {
+
+            }
+        }
     }
 
-    message[bytesReceived] = '\0';
-    printf("Got \"%s\"\n", message);
-
-    sleep(1);
-
-    srand(time(NULL));
-    int messageIndex = rand() % 2;
-    char* testMessage = MSG_LOGIN;
-    if(messageIndex == 1)
-        testMessage = MSG_LOGOUT;
-
-    if ((bytesSent=sendto(clientFd, testMessage, strlen(testMessage), 0,
-         (struct sockaddr *)&serverAddress, sizeof(struct sockaddr))) < 0) 
-    {
-        ERR("sendto");
-    }
-
-    if ((bytesReceived = recvfrom(clientFd, message, MAX_BUF-1, 0,
-            (struct sockaddr *)&serverAddress, &structSize)) == -1) 
-    {
-        ERR("recvfrom");
-    }
-
-    message[bytesReceived] = '\0';
-    printf("Got \"%s\"\n", message);
+    sendMessage(clientFd, serverAddress, MSG_LOGOUT);
+    receiveMessage(clientFd, message);
+    // EXIT
 }
 
 int main(int argc, char **argv)
@@ -136,6 +179,14 @@ int main(int argc, char **argv)
 
     int socketFd = makeSocket(AF_INET, SOCK_DGRAM);
     setSignalHandler(SIGINT, handleSigInt);
+
+    struct timeval messageTimeout;
+    messageTimeout.tv_sec = 2;
+    messageTimeout.tv_usec = 0;
+    if (setsockopt(socketFd, SOL_SOCKET, SO_RCVTIMEO, &messageTimeout, sizeof(messageTimeout)) < 0) 
+    {
+        ERR("setsockopt");
+    }
 
     doClient(socketFd);
 

@@ -99,11 +99,11 @@ void sendMessage(int serverFd, clientArgs_t client, char* message)
     }
 }
 
-void sendMessageToAll(int serverFd, clientArgs_t clients[], char* message)
+void sendMessageToOther(int serverFd, clientArgs_t clients[], int senderId, char* message)
 {
     for(int i = 0; i < MAX_CLIENTS; i++)
     {
-        if(clients[i].id != -1)
+        if(clients[i].id != -1 && clients[i].id != senderId)
         {
             sendMessage(serverFd, clients[i], message);
         }
@@ -178,7 +178,7 @@ void doServer(int serverFd)
                     }
                 }
                 snprintf(tmpMessage, MAX_BUF, "new user %d", clientId);
-                sendMessageToAll(serverFd, clients, tmpMessage);
+                sendMessageToOther(serverFd, clients, clientId, tmpMessage);
 
                 clients[clientId].id = clientId;
                 clients[clientId].address = clientAddress;
@@ -196,16 +196,17 @@ void doServer(int serverFd)
             clientsCount--;
 
             snprintf(tmpMessage, MAX_BUF, "user %d logged out", clientId);
-            sendMessageToAll(serverFd, clients, tmpMessage);
+            sendMessageToOther(serverFd, clients, clientId, tmpMessage);
         }
         else // message from stdin
         {
-
+            snprintf(tmpMessage, MAX_BUF, "%d: %s", clientId, message);
+            sendMessageToOther(serverFd, clients, clientId, tmpMessage);
         }
     }
 
     // Closing
-    sendMessageToAll(serverFd, clients, MSG_CLOSED);
+    sendMessageToOther(serverFd, clients, -1, MSG_CLOSED);
 }
 
 int main(int argc, char **argv)
