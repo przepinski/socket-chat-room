@@ -35,6 +35,7 @@ typedef struct clientArgs
 {
     int id;
     struct sockaddr_in address;
+    struct timeval lastPong;
 } clientArgs_t;
 
 void usage(char *fileName)
@@ -53,9 +54,16 @@ void setSignalHandler(int signal, void (*handler)(int))
 }
 
 volatile sig_atomic_t shouldQuit = 0;
+volatile sig_atomic_t lastSignal = 0;
 void handleSigInt(int signal)
 {
     shouldQuit = 1;
+    lastSignal = signal;
+}
+
+void handleSigAlrm(int signal)
+{
+    lastSignal = signal;
 }
 
 int makeSocket(int domain, int type)
@@ -92,10 +100,12 @@ void sendMessage(int serverFd, clientArgs_t client, char* message)
 {
     int bytesSent;
     printf("[SENT] \"%s\" to %d\n\n", message, client.id);
+    // printf("Family: %d, should be: %d\n", client.address.sin_family, AF_INET);
+    // printf("IP: %lu, Port: %d\n", (unsigned long)client.address.sin_addr.s_addr, client.address.sin_port);
     if ((bytesSent=sendto(serverFd, message, strlen(message), 0,
          (struct sockaddr *)&client.address, sizeof(struct sockaddr))) < 0) 
     {
-			ERR("sendto");
+        ERR("sendto");
     }
 }
 
@@ -110,6 +120,93 @@ void sendMessageToOther(int serverFd, clientArgs_t clients[], int senderId, char
     }
 }
 
+void logoutClient(int serverFd, clientArgs_t clients[], int clientId)
+{
+    char tmpMessage[MAX_BUF];
+    sendMessage(serverFd, clients[clientId], MSG_LOGOUT);
+
+    clients[clientId].id = -1;
+    clientsCount--;
+
+    snprintf(tmpMessage, MAX_BUF, "user %d logged out", clientId);
+    sendMessageToOther(serverFd, clients, clientId, tmpMessage);
+}
+
+void receiveMessage(int serverFd, clientArgs_t clients[], clientArgs_t* tmpClient, char* message)
+{
+    uint structSize = sizeof(struct sockaddr), bytesReceived;
+    tmpClient->id = -1;
+
+    if ((bytesReceived = recvfrom(serverFd, message, MAX_BUF-1, 0,
+            (struct sockaddr *)&tmpClient->address, &structSize)) == -1) 
+    {
+        if (errno == EINTR)
+        {
+            tmpClient->id = -2;
+            return;
+        }
+            
+        ERR("recvfrom");
+    }
+    message[bytesReceived] = '\0';
+
+    //printf("[REQUEST]Client on port: %hu\n", clientAddress.sin_port);
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if(clients[i].id != -1 && clients[i].address.sin_port == tmpClient->address.sin_port)
+        {
+            *tmpClient = clients[i];
+            break;
+        }
+    }
+
+    printf("[GOT] \"%s\" from %d\n", message, tmpClient->id);
+}
+
+void checkKeepAlive(int serverFd, clientArgs_t clients[])
+{
+    struct timeval currentTime;
+    gettimeofday(&currentTime, NULL);
+    long secondsSinceLastPong;
+
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if(clients[i].id != -1)
+        {
+            secondsSinceLastPong  = currentTime.tv_sec  - clients[i].lastPong.tv_sec;
+            if (secondsSinceLastPong >= 6)
+            {
+                printf("\tNo response from %d - logging out\n", i);
+                logoutClient(serverFd, clients, i);
+            }
+        }
+    }
+}
+
+void acceptNewClient(int serverFd, clientArgs_t* currentClient, clientArgs_t clients[])
+{
+    char tmpMessage[MAX_BUF];
+    int freeId = -1;
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].id == -1)
+        {
+            freeId = i;
+            break;
+        }
+    }
+    snprintf(tmpMessage, MAX_BUF, "new user %d", freeId);
+    sendMessageToOther(serverFd, clients, freeId, tmpMessage);
+
+    clients[freeId].id = freeId;
+    clients[freeId].address = currentClient->address;
+    gettimeofday(&clients[freeId].lastPong, NULL);
+    clientsCount++;
+
+    snprintf(tmpMessage, MAX_BUF, "#ack %d", freeId);
+    sendMessage(serverFd, clients[freeId], tmpMessage);
+}
+
 void doServer(int serverFd)
 {
     clientArgs_t clients[MAX_CLIENTS];
@@ -118,85 +215,53 @@ void doServer(int serverFd)
         clients[i].id = -1;
     }
 
+    char message[MAX_BUF];
+
+    alarm(3);
     while (!shouldQuit)
     {
-        struct sockaddr_in clientAddress;
-        memset(&clientAddress, 0x00, sizeof(struct sockaddr_in));
-        uint structSize = sizeof(struct sockaddr), bytesReceived;
-        char message[MAX_BUF];
+        memset(message, 0x00, MAX_BUF);
+        checkKeepAlive(serverFd, clients);
 
-        if ((bytesReceived = recvfrom(serverFd, message, MAX_BUF-1, 0,
-                (struct sockaddr *)&clientAddress, &structSize)) == -1) 
+        if(lastSignal == SIGALRM)
         {
-			if (errno == EINTR)
-			{
-				continue;
-			}
-			ERR("recvfrom");
+            sendMessageToOther(serverFd, clients, -1, MSG_PING);
+            lastSignal = -1;
+            alarm(3);
         }
 
-        // Find sender in clients list
-        int clientId = -1;
-        //printf("[REQUEST]Client on port: %hu\n", clientAddress.sin_port);
-        for(int i = 0; i < MAX_CLIENTS; i++)
-        {
-            if(clients[i].id != -1 && clients[i].address.sin_port == clientAddress.sin_port)
-            {
-                clientId = i;
-                break;
-            }
-        }
-
-        message[bytesReceived] = '\0';
-        printf("[GOT] \"%s\" from %d\n", message, clientId);
+        clientArgs_t currentClient;
+        receiveMessage(serverFd, clients, &currentClient, message);
+        int clientId = currentClient.id;
+        if(clientId == -2)
+            continue;
 
         // Detect message type
         char tmpMessage[MAX_BUF];
-        if(strcmp(message, MSG_LOGIN) == 0) // MSG_LOGIN
+        if(strcmp(message, MSG_LOGIN) == 0)
         {
-            if(clientsCount >= MAX_CLIENTS || clientId != -1)
+            if(clientId != -1) // DENY
             {
-                clientArgs_t tmpClient;
-                tmpClient.address = clientAddress;
-                tmpClient.id = -1;
-                sendMessage(serverFd, tmpClient, MSG_LOGOUT);
-                if(clientId != -1)
-                {
-                    clients[clientId].id = -1;
-                    clientsCount--;
-                }
+                logoutClient(serverFd, clients, clientId);
             }
-            else if(clientsCount < MAX_CLIENTS)
+            else if(clientsCount >= MAX_CLIENTS) // DENY
             {
-                // Add client
-                for(int i = 0; i < MAX_CLIENTS; i++)
-                {
-                    if (clients[i].id == -1)
-                    {
-                        clientId = i;
-                        break;
-                    }
-                }
-                snprintf(tmpMessage, MAX_BUF, "new user %d", clientId);
-                sendMessageToOther(serverFd, clients, clientId, tmpMessage);
-
-                clients[clientId].id = clientId;
-                clients[clientId].address = clientAddress;
-                clientsCount++;
-
-                snprintf(tmpMessage, MAX_BUF, "#ack %d", clientId);
-                sendMessage(serverFd, clients[clientId], tmpMessage);
+                sendMessage(serverFd, currentClient, MSG_LOGOUT);
+            }
+            else if(clientsCount < MAX_CLIENTS) // ACCEPT
+            {
+                acceptNewClient(serverFd, &currentClient, clients);
             }
         }
-        else if (strcmp(message, MSG_LOGOUT) == 0) // MSG_LOGOUT
+        else if (strcmp(message, MSG_LOGOUT) == 0)
         {
-            sendMessage(serverFd, clients[clientId], MSG_LOGOUT);
-
-            clients[clientId].id = -1;
-            clientsCount--;
-
-            snprintf(tmpMessage, MAX_BUF, "user %d logged out", clientId);
-            sendMessageToOther(serverFd, clients, clientId, tmpMessage);
+            logoutClient(serverFd, clients, clientId);
+        }
+        else if(strcmp(message, MSG_PONG) == 0)
+        {
+            struct timeval pongTime;
+            gettimeofday(&pongTime, NULL);
+            clients[clientId].lastPong = pongTime;
         }
         else // message from stdin
         {
@@ -217,6 +282,7 @@ int main(int argc, char **argv)
     int socketFd = bindUdpSocket(atoi(PORT));
 
     setSignalHandler(SIGINT, handleSigInt);
+    setSignalHandler(SIGALRM, handleSigAlrm);
 
     printf("Listening for connections on %s\n", PORT);
 

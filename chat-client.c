@@ -90,11 +90,11 @@ void sendMessage(int clientFd, struct sockaddr_in serverAddress, char* message)
     }
 }
 
-void receiveMessage(int clientFd, char* message)
+void receiveMessage(int socketFd, char* message)
 {
     uint bytesReceived;
 
-    if ((bytesReceived = recvfrom(clientFd, message, MAX_BUF-1, 0, NULL, NULL)) == -1) 
+    if ((bytesReceived = recvfrom(socketFd, message, MAX_BUF-1, 0, NULL, NULL)) == -1) 
     {
         if (errno != EINTR && errno != EAGAIN) // signal or timeout
         {
@@ -131,12 +131,27 @@ void doClient(int clientFd)
     sigaddset(&mask, SIGINT);
     sigprocmask(SIG_BLOCK, &mask, &oldmask);
 
+    struct timeval lastPing;
+    gettimeofday(&lastPing, NULL);
+
     while(!shouldQuit)
     {
-        readFdsSet = masterFdsSet;
-        if (pselect(clientFd+1, &readFdsSet, NULL, NULL, NULL, &oldmask) == -1)
+        struct timeval currentTime;
+        gettimeofday(&currentTime, NULL);
+        long secondsSinceLastPing  = currentTime.tv_sec  - lastPing.tv_sec;
+        if(secondsSinceLastPing >= 6)
         {
-            if (errno == EINTR) 
+            shouldQuit = 1;
+            continue;
+        }
+
+        readFdsSet = masterFdsSet;
+        struct timespec pselectTimeout;
+        pselectTimeout.tv_sec = 6;
+        pselectTimeout.tv_nsec = 0;
+        if (pselect(clientFd+1, &readFdsSet, NULL, NULL, &pselectTimeout, &oldmask) == -1)
+        {
+            if (errno == EINTR || errno == EAGAIN) 
                 continue;
 
             ERR("pselect");
@@ -164,9 +179,10 @@ void doClient(int clientFd)
             {
                 shouldQuit = 1;
             }
-            else 
+            else if(strcmp(message, MSG_PING) == 0)
             {
-
+                gettimeofday(&lastPing, NULL);
+                sendMessage(clientFd, serverAddress, MSG_PONG);
             }
         }
     }
