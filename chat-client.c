@@ -144,12 +144,17 @@ void doClient(int clientFd)
 
         if (FD_ISSET(STDIN, &readFdsSet))
         {
-            fgets(stdinData, sizeof(stdinData), stdin);
+            if (fgets(stdinData, sizeof(stdinData), stdin) == NULL)
+            {
+                shouldQuit = 1;
+                continue;
+            }
 
             dataLength = strlen(stdinData) - 1;
             if (stdinData[dataLength] == '\n')
                 stdinData[dataLength] = '\0';
 
+            printf("Read: %s\n", stdinData);
             sendMessage(clientFd, serverAddress, stdinData);
         }
         if (FD_ISSET(clientFd, &readFdsSet))
